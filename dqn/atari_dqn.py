@@ -5,6 +5,7 @@
 # Contains code from:
 # CleanRL - MIT License - Copyright (c) 2019 CleanRL developers
 # EnvPool - Apache License 2.0 - Copyright (c) 2022 Garena Online Private Limited
+# Stable Baselines3 - MIT License - Copyright (c) 2019 Antonin Raffin
 
 import argparse
 import os
@@ -20,17 +21,14 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
+import torch.optim.lr_scheduler as lr_sched
 from torch.cuda.amp import autocast, GradScaler
 
-from stable_baselines3.common.evaluation import evaluate_policy
-from stable_baselines3.common.vec_env import VecEnvWrapper, VecMonitor
-from stable_baselines3.common.vec_env.base_vec_env import VecEnvObs, VecEnvStepReturn
+from stable_baselines3.common.vec_env import VecMonitor
 from stable_baselines3.dqn import DQN, CnnPolicy
 from stable_baselines3.common.policies import BasePolicy
 
 import envpool
-from envpool.python.protocol import EnvPool
 
 import wandb
 
@@ -42,6 +40,8 @@ if __package__ is None:
     __package__ = DIR.name
 
 from util.atari_buffer import TorchAtariReplayBuffer
+from util.env_wrappers import RecordEpisodeStatistics, VecAdapter
+from util.helpers import linear_schedule, num_train_steps, evaluate_sb3, get_optimizer
 
 
 def parse_args():
@@ -92,7 +92,7 @@ def parse_args():
     parser.add_argument("--gamma", type=float, default=0.99,
         help="the discount factor gamma")
     parser.add_argument("--target-network-frequency", type=int, default=1000,
-        help="the timesteps it takes to update the target network")
+        help="the number of steps it takes to update the target network. incremented in training loop by batch-size/samples-step")
     parser.add_argument("--batch-size", type=int, default=32,
         help="the batch size of sample from the reply memory")
     parser.add_argument("--start-e", type=float, default=1,
@@ -103,106 +103,22 @@ def parse_args():
         help="the fraction of `total-timesteps` it takes from start-e to go end-e")
     parser.add_argument("--learning-starts", type=int, default=80_000,
         help="timestep to start learning")
-    parser.add_argument("--train-frequency", type=int, default=4,
-        help="the frequency of training")
+    parser.add_argument("--samples-step", type=int, default=8,
+        help="samples to train on per env step. auto-adjusts to batch-size and num-envs. default of 8 is equivalent of train-frequency=4, batch-size=32, num-envs=1")
     parser.add_argument("--eval-episodes", type=int, default=20,
         help="number of evaluation episides/environments")
     parser.add_argument("--eval-frequency", type=int, default=25_000,
         help="the frequency of evaluation")
+    parser.add_argument("--one-cycle", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
+        help="whether to use 1cycle policy scheduler")
     args = parser.parse_args()
     # fmt: on
     return args
 
-# CleanRL wrapper for stats tracking
-class RecordEpisodeStatistics(gym.Wrapper):
-    def __init__(self, env, deque_size=100):
-        super().__init__(env)
-        self.num_envs = getattr(env, "num_envs", 1)
-        self.episode_returns = None
-        self.episode_lengths = None
-        # get if the env has lives
-        self.has_lives = False
-        env.reset()
-        info = env.step(np.zeros(self.num_envs, dtype=int))[-1]
-        if info["lives"].sum() > 0:
-            self.has_lives = True
-
-    def reset(self, **kwargs):
-        observations = super().reset(**kwargs)
-        self.episode_returns = np.zeros(self.num_envs, dtype=np.float32)
-        self.episode_lengths = np.zeros(self.num_envs, dtype=np.int32)
-        self.lives = np.zeros(self.num_envs, dtype=np.int32)
-        self.returned_episode_returns = np.zeros(self.num_envs, dtype=np.float32)
-        self.returned_episode_lengths = np.zeros(self.num_envs, dtype=np.int32)
-        return observations
-
-    def step(self, action):
-        observations, rewards, dones, infos = super().step(action)
-        self.episode_returns += infos["reward"]
-        self.episode_lengths += 1
-        self.returned_episode_returns[:] = self.episode_returns
-        self.returned_episode_lengths[:] = self.episode_lengths
-        all_lives_exhausted = infos["lives"] == 0
-        if self.has_lives:
-            self.episode_returns *= 1 - all_lives_exhausted
-            self.episode_lengths *= 1 - all_lives_exhausted
-        else:
-            self.episode_returns *= 1 - dones
-            self.episode_lengths *= 1 - dones
-        infos["r"] = self.returned_episode_returns
-        infos["l"] = self.returned_episode_lengths
-        return (
-            observations,
-            rewards,
-            dones,
-            infos,
-        )
-
-# EnvPool SB3 adaptor for evaluation
-class VecAdapter(VecEnvWrapper):
-  """
-  Convert EnvPool object to a Stable-Baselines3 (SB3) VecEnv.
-  :param venv: The envpool object.
-  """
-
-  def __init__(self, venv: EnvPool):
-    # Retrieve the number of environments from the config
-    venv.num_envs = venv.spec.config.num_envs
-    super().__init__(venv=venv)
-
-  def step_async(self, actions: np.ndarray) -> None:
-    self.actions = actions
-
-  def reset(self) -> VecEnvObs:
-    return self.venv.reset()
-
-  def seed(self, seed:int = None) -> None:
-    # You can only seed EnvPool env by calling envpool.make()
-    pass
-
-  def step_wait(self) -> VecEnvStepReturn:
-    obs, rewards, dones, info_dict = self.venv.step(self.actions)
-    infos = []
-    # Convert dict to list of dict
-    # and add terminal observation
-    for i in range(self.num_envs):
-      infos.append(
-        {
-          key: info_dict[key][i]
-          for key in info_dict.keys()
-          if isinstance(info_dict[key], np.ndarray)
-        }
-      )
-      if dones[i]:
-        infos[i]["terminal_observation"] = obs[i]
-        obs[i] = self.venv.reset(np.array([i]))
-
-    return obs, rewards, dones, infos
-
 
 # ALGO LOGIC: initialize agent here:
 class QNetwork(BasePolicy):
-    def __init__(self, env, drop):
+    def __init__(self, env, drop, normalize=True):
         super().__init__(None, None)
         self.network = nn.Sequential(
             nn.Conv2d(4, 32, 8, stride=4),
@@ -217,10 +133,12 @@ class QNetwork(BasePolicy):
             nn.Dropout(p=drop),
             nn.Linear(512, env.single_action_space.n),
         )
+        self.normalize = True
 
     def forward(self, x:torch.Tensor):
-        with torch.no_grad():
-             x = x / 255.0
+        if self.normalize:
+            with torch.no_grad():
+                x = x / 255.0
         return self.network(x)
 
     ## Compatability with SB3 evaluate_policy
@@ -229,37 +147,11 @@ class QNetwork(BasePolicy):
 
     @torch.jit.unused
     def _predict(self, observation: torch.Tensor, deterministic: bool = True) -> torch.Tensor:
-        q_values = self(observation)
+        q_values = self.forward(observation)
         # Greedy action
         action = q_values.argmax(dim=1).reshape(-1)
         return action
 
-
-def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
-    slope = (end_e - start_e) / duration
-    return max(slope * t + start_e, end_e)
-
-
-def num_train_steps(global_steps, num_envs, train_freq):
-    if num_envs > train_freq:
-        return True, int(num_envs/train_freq)
-    else:
-        return global_steps % train_freq == 0, 1
-
-
-def eval(model, env, eval_eps, track, step=None):
-    start_time = time.time()
-    rewards, lengths = evaluate_policy(model, env, n_eval_episodes=eval_eps, return_episode_rewards=True)
-    finish_time = time.time()
-    mean_reward, std_reward = np.mean(rewards), np.std(rewards)
-    mean_ep_length, std_ep_length = np.mean(lengths), np.std(lengths)
-    if track:
-        wandb.log({"eval/mean_reward": mean_reward,
-                   "eval/stdev_reward": std_reward,
-                   "eval/mean_ep_length": mean_ep_length,
-                   "eval/stdev_ep_length": std_ep_length,
-                   "time/eval_fps": int(np.sum(lengths) / (finish_time - start_time))}, step=step)
-    print(f"Mean Reward: {mean_reward:>7.2f}  +/- {std_reward:>7.2f}   Mean Ep Len: {mean_ep_length:>7.2f}  +/- {std_ep_length:>7.2f}   Step: {global_step:>8}")
 
 
 if __name__ == "__main__":
@@ -318,16 +210,7 @@ if __name__ == "__main__":
     target_network.load_state_dict(q_network.state_dict())
 
     # set the optimizer
-    if args.optimizer == 'Adam':
-        optimizer = optim.Adam(q_network.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-    elif args.optimizer == 'AdamW':
-        optimizer = optim.AdamW(q_network.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-    elif args.optimizer == 'SGD':
-        optimizer = optim.SGD(q_network.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-    elif args.optimizer == 'RMSprop':
-        optimizer = optim.RMSprop(q_network.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-    else:
-        raise ValueError(f'Invalid optimizer, {args.optimizer} must be one of Adam, AdamW, SGD, or RMSprop')
+    optimizer = get_optimizer(args.optimizer, q_network.parameters(), lr=args.learning_rate, wd=args.weight_decay)
 
     dqn_eval.policy.q_net = q_network
 
@@ -341,37 +224,46 @@ if __name__ == "__main__":
         n_envs=args.num_envs
     )
 
-    num_timesteps, loss_count, target_count, target_updated = 0, 0, 0, 0
+    train_steps, num_timesteps_phase, eval_time, loss_count, target_count, target_updated = 0, 0, 0, 0, 0, 0
     smooth_loss, smooth_q, beta =  torch.tensor(0., device=device), torch.tensor(0., device=device), torch.tensor(0.98, device=device)
     reward_queue, ep_len_queue = deque(maxlen=100), deque(maxlen=100)
+    started_learning = False
 
     log_frequency = args.num_envs*int(args.log_frequency/args.num_envs) if int(args.log_frequency/args.num_envs) > 0 else args.num_envs
     eval_frequency = args.num_envs*int(args.eval_frequency/args.num_envs) if int(args.eval_frequency/args.num_envs) > 0 else args.eval_frequency
 
+    if args.one_cycle:
+        _, steps = num_train_steps(0, args.num_envs, args.samples_step, args.batch_size)
+        training_steps = steps*int(1+(args.total_timesteps-args.learning_starts)/args.num_envs+1)
+        scheduler = lr_sched.OneCycleLR(optimizer, max_lr=args.learning_rate, steps_per_epoch=training_steps, pct_start=args.exploration_fraction, epochs=1)
+    else: 
+        scheduler = None
+
     # TRY NOT TO MODIFY: start the game
     obs = torch.from_numpy(envs.reset()).to(device)
+    start_time = time.time()
     for global_step in range(0, args.total_timesteps, args.num_envs):
-        start_time = time.time()
-        num_timesteps += args.num_envs
-        # ALGO LOGIC: put action logic here
+
+        # Don't decrease epsilon-greedy until learning starts
         if global_step > args.learning_starts:
             epsilon = linear_schedule(args.start_e, args.end_e, args.exploration_fraction * args.total_timesteps, global_step-args.learning_starts)
         else:
             epsilon = args.start_e
         
+        # ALGO LOGIC: put action logic here
         rand_actions = nprng.integers(0, envs.single_action_space.n, envs.num_envs)
         if epsilon < 1:
             q_network.eval()
             with torch.no_grad(), ac:
                 logits = q_network(obs)
                 actions = torch.argmax(logits, dim=1)
-
             actions = actions.cpu().numpy()
             idxs = np.where(nprng.random(args.num_envs) < epsilon)[0]
             if len(idxs) > 0: actions[idxs] = rand_actions[idxs]
         else:
             actions = rand_actions
 
+        # play out the next step
         next_obs, rewards, dones, infos = envs.step(actions)
 
         # TRY NOT TO MODIFY: save data to reply buffer
@@ -394,7 +286,7 @@ if __name__ == "__main__":
                 ep_len_queue.append(infos['l'][idxs])
         rb.add(obs, real_next_obs, actions, rewards, dones.to(device), infos)
 
-        # TRY NOT TO MODIFY: record rewards for plotting purposes
+        # TRY NOT TO MODIFY: record SB3 style rewards for plotting purposes
         if global_step % log_frequency == 0 and global_step > 0:
             if args.track:
                 if len(reward_queue) > 0:
@@ -408,8 +300,14 @@ if __name__ == "__main__":
         obs = next_obs
 
         # ALGO LOGIC: training.
-        train, steps = num_train_steps(global_step, args.num_envs, args.train_frequency)
+        train, steps = num_train_steps(global_step, args.num_envs, args.samples_step, args.batch_size)
         if global_step > args.learning_starts and train:
+            # Reset time metrics for accurate training fps
+            if not started_learning:
+                started_learning = True
+                total_train_time = 0
+                start_time = time.time()
+                num_timesteps_phase = global_step - args.num_envs
             train_start = time.time()
 
             # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
@@ -431,13 +329,16 @@ if __name__ == "__main__":
                 else:
                     loss.backward()
                     optimizer.step()
+                if scheduler is not None: 
+                    scheduler.step()
                 optimizer.zero_grad()
 
                 # TRY NOT TO MODIFY: record losses for plotting purposes
                 smooth_loss = torch.lerp(loss.float(), smooth_loss, beta)
                 smooth_q    = torch.lerp(pred.mean().float(), smooth_q, beta)
                 loss_count += 1
-                target_count += args.train_frequency
+                target_count += int(args.batch_size/args.samples_step)
+                train_steps += args.batch_size
 
                 # update the target network
                 if target_count >= args.target_network_frequency:
@@ -446,6 +347,7 @@ if __name__ == "__main__":
                     target_count = 0
                     if args.track: wandb.log({"train/target_updated": target_updated}, step=global_step)
             train_finish = time.time()
+            total_train_time += train_finish - train_start
 
         if global_step % log_frequency == 0 and loss_count > 0:
             smooth_val = smooth_loss.cpu()/(1-0.98**loss_count)
@@ -460,18 +362,24 @@ if __name__ == "__main__":
         finish_time = time.time() 
         if global_step % log_frequency == 0:
             if args.track:
+                time_elapsed = time.time() - start_time - eval_time
+                total_fps = int((global_step - num_timesteps_phase) / time_elapsed)
                 if global_step > args.learning_starts and train:
-                    wandb.log({"time/fps": int(args.num_envs / (finish_time - start_time)),
-                               "time/train_fps": int(args.batch_size*steps / (train_finish - train_start)),
-                               "time/play_fps": int(args.num_envs / (train_start - start_time))}, step=global_step)
+                    wandb.log({"time/fps": total_fps,
+                               "time/train_fps": int(train_steps / total_train_time),
+                               "time/play_fps": int((global_step - num_timesteps_phase) / (time_elapsed - total_train_time))}, step=global_step)
                 else:
-                    wandb.log({"time/fps": int(args.num_envs / (finish_time - start_time))}, step=global_step)
+                    wandb.log({"time/fps": total_fps}, step=global_step)
 
         if global_step % eval_frequency == 0 and loss_count > 0:
-            eval(dqn_eval, eval_env, args.eval_episodes, args.track, global_step)
+            eval_start = time.time()
+            mean_reward, std_reward, mean_ep_length, std_ep_length, _ = evaluate_sb3(dqn_eval, eval_env, args.eval_episodes, args.track, global_step)
+            print(f"Mean Reward: {mean_reward:>7.2f}  +/- {std_reward:>7.2f}   Mean Ep Len: {mean_ep_length:>7.2f}  +/- {std_ep_length:>7.2f}   Step: {global_step:>8}")
+            eval_time += time.time() - eval_start
 
     # final eval
-    eval(dqn_eval, eval_env, args.eval_episodes, args.track, global_step)
+    mean_reward, std_reward, mean_ep_length, std_ep_length, _ = evaluate_sb3(dqn_eval, eval_env, args.eval_episodes, args.track, global_step)
+    print(f"Mean Reward: {mean_reward:>7.2f}  +/- {std_reward:>7.2f}   Mean Ep Len: {mean_ep_length:>7.2f}  +/- {std_ep_length:>7.2f}   Step: {global_step:>8}")
 
     path = Path(args.save_folder)
     path.mkdir(exist_ok=True)

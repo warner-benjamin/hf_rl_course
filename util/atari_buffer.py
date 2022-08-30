@@ -212,4 +212,4 @@ class TorchAtariReplayBuffer(BaseBuffer):
             (self.dones[batch_inds, env_indices].int() * (1 - self.timeouts[batch_inds, env_indices].int())).view(-1, 1),
             self._normalize_reward(rewards, env) if self.normalize else rewards,
         )
-        return ReplayBufferSamples(*tuple(data))
+        return ReplayBufferSamples(*data)
