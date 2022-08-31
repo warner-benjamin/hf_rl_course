@@ -17,12 +17,6 @@ import numpy as np
 
 from gym import spaces
 
-try:
-    # Check memory used by replay buffer when possible
-    import psutil
-except ImportError:
-    psutil = None
-
 numpy_to_torch_dtype_dict = {
     bool          : torch.bool,
     np.bool       : torch.bool,
@@ -81,10 +75,6 @@ class TorchAtariReplayBuffer(BaseBuffer):
         # I think we don't normalize for envpool
         self.normalize = normalize
 
-        # Check that the replay buffer can fit into the memory
-        if psutil is not None:
-            mem_available = psutil.virtual_memory().available
-
         # there is a bug if both optimize_memory_usage and handle_timeout_termination are true
         # see https://github.com/DLR-RM/stable-baselines3/issues/934
         if optimize_memory_usage and handle_timeout_termination:
@@ -111,20 +101,6 @@ class TorchAtariReplayBuffer(BaseBuffer):
         self.handle_timeout_termination = handle_timeout_termination
         self.timeouts = torch.zeros((self.buffer_size, self.n_envs), dtype=torch.bool, device=device)
 
-        if psutil is not None:
-            total_memory_usage = self.observations.storage().nbytes() + self.actions.storage().nbytes() + self.rewards.storage().nbytes() + self.dones.storage().nbytes()
-
-            if self.next_observations is not None:
-                total_memory_usage += self.next_observations.storage().nbytes()
-
-            if total_memory_usage > mem_available:
-                # Convert to GB
-                total_memory_usage /= 1e9
-                mem_available /= 1e9
-                warnings.warn(
-                    "This system does not have apparently enough memory to store the complete "
-                    f"replay buffer {total_memory_usage:.2f}GB > {mem_available:.2f}GB"
-                )
 
     def add(
         self,
