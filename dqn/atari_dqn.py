@@ -250,7 +250,7 @@ if __name__ == "__main__":
         else:
             epsilon = args.start_e
         
-        # ALGO LOGIC: put action logic here
+        # ALGO LOGIC: take random actions, play observations, combine per epsilon greedy
         rand_actions = nprng.integers(0, envs.single_action_space.n, envs.num_envs)
         if epsilon < 1:
             q_network.eval()
@@ -266,10 +266,9 @@ if __name__ == "__main__":
         # play out the next step
         next_obs, rewards, dones, infos = envs.step(actions)
 
-        # TRY NOT TO MODIFY: save data to reply buffer
+        # TRY NOT TO MODIFY: move results to GPU
         next_obs = torch.from_numpy(next_obs).to(device)
-        if isinstance(actions, np.ndarray):
-            actions = torch.from_numpy(actions).to(device)
+        actions = torch.from_numpy(actions).to(device)
         rewards = torch.from_numpy(rewards).to(device)
         dones = torch.from_numpy(dones)
         real_next_obs = next_obs.clone()
@@ -284,6 +283,8 @@ if __name__ == "__main__":
             else:
                 reward_queue.append(infos['r'][idxs])
                 ep_len_queue.append(infos['l'][idxs])
+
+        # TRY NOT TO MODIFY: save data to reply buffer
         rb.add(obs, real_next_obs, actions, rewards, dones.to(device), infos)
 
         # TRY NOT TO MODIFY: record SB3 style rewards for plotting purposes
@@ -374,12 +375,12 @@ if __name__ == "__main__":
         if global_step % eval_frequency == 0 and loss_count > 0:
             eval_start = time.time()
             mean_reward, std_reward, mean_ep_length, std_ep_length, _ = evaluate_sb3(dqn_eval, eval_env, args.eval_episodes, args.track, global_step)
-            print(f"Mean Reward: {mean_reward:>7.2f}  +/- {std_reward:>7.2f}   Mean Ep Len: {mean_ep_length:>7.2f}  +/- {std_ep_length:>7.2f}   Step: {global_step:>8}")
+            print(f"Mean Reward: {mean_reward:>7.2f}  ± {std_reward:>7.2f}   Mean Ep Len: {mean_ep_length:>7.2f}  ± {std_ep_length:>7.2f}   Step: {global_step:>8}")
             eval_time += time.time() - eval_start
 
     # final eval
     mean_reward, std_reward, mean_ep_length, std_ep_length, _ = evaluate_sb3(dqn_eval, eval_env, args.eval_episodes, args.track, global_step)
-    print(f"Mean Reward: {mean_reward:>7.2f}  +/- {std_reward:>7.2f}   Mean Ep Len: {mean_ep_length:>7.2f}  +/- {std_ep_length:>7.2f}   Step: {global_step:>8}")
+    print(f"Mean Reward: {mean_reward:>7.2f}  ± {std_reward:>7.2f}   Mean Ep Len: {mean_ep_length:>7.2f}  ± {std_ep_length:>7.2f}   Step: {global_step:>8}")
 
     path = Path(args.save_folder)
     path.mkdir(exist_ok=True)
