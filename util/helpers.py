@@ -1,10 +1,32 @@
-
+import os
 import time
 import wandb
+import torch
+import envpool
 import numpy as np
 import torch.optim as optim
-
+from util.env_wrappers import VecAdapter
+from stable_baselines3.common.vec_env import VecMonitor
 from stable_baselines3.common.evaluation import evaluate_policy
+
+
+def num_cpus():
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError: 
+        return os.cpu_count()
+
+
+def get_eval_env(env_id, env_type, num_envs, seed, num_threads=None):
+    if num_threads is None:
+        num_threads = num_cpus()
+    else:
+        num_threads = min(num_threads, num_cpus())
+    eval_env = envpool.make(env_id, env_type=env_type, num_envs=num_envs, seed=seed, num_threads=num_threads)
+    eval_env.spec.id = env_id
+    eval_env = VecAdapter(eval_env)
+    eval_env = VecMonitor(eval_env)
+    return eval_env
 
 
 def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
@@ -19,6 +41,7 @@ def num_train_steps(global_steps, num_envs, samples_step, batch_size):
         return global_steps % int(batch_size/samples_step) == 0, 1
 
 
+@torch.no_grad()
 def evaluate_sb3(model, env, eval_eps, track, step=None, prefix='', log_time=True):
     start_time = time.time()
     rewards, lengths = evaluate_policy(model, env, n_eval_episodes=eval_eps, return_episode_rewards=True)
@@ -35,6 +58,7 @@ def evaluate_sb3(model, env, eval_eps, track, step=None, prefix='', log_time=Tru
         wandb.log(log, step=step)
         
     return mean_reward, std_reward, mean_ep_length, std_ep_length, fps
+
 
 def get_optimizer(opt_name, parameters, lr, wd):
     if opt_name == 'Adam':

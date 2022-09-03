@@ -25,7 +25,6 @@ import torch.nn.functional as F
 import torch.optim.lr_scheduler as lr_sched
 from torch.cuda.amp import autocast, GradScaler
 
-from stable_baselines3.common.vec_env import VecMonitor
 from stable_baselines3.dqn import DQN, CnnPolicy
 from stable_baselines3.common.policies import BasePolicy
 
@@ -43,8 +42,8 @@ if __package__ is None:
     __package__ = DIR.name
 
 from util.atari_buffer import TorchAtariReplayBuffer
-from util.env_wrappers import RecordEpisodeStatistics, VecAdapter
-from util.helpers import linear_schedule, num_train_steps, evaluate_sb3, get_optimizer
+from util.env_wrappers import RecordEpisodeStatistics
+from util.helpers import linear_schedule, num_train_steps, evaluate_sb3, get_optimizer, get_eval_env, num_cpus
 
 
 def parse_args():
@@ -66,14 +65,14 @@ def parse_args():
         help="the wandb's run group")
     parser.add_argument("--entity", type=str, default=None,
         help="the entity (team) of wandb's project")
-    parser.add_argument("--capture-video", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
-        help="whether to capture videos of the agent performances (check out `videos` folder)")
     parser.add_argument("--fp16", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, will train using automatic mixed precision")
     parser.add_argument("--log-frequency", type=int, default=1000,
         help="how often to log training data")
     parser.add_argument("--save-folder", type=str, default="models",
         help="where to save the final model")
+    parser.add_argument("--num-threads", type=int, default=None,
+        help="number of cpu threads to use for envs, defaults to num_cpus")
 
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="SpaceInvaders-v5",
@@ -110,6 +109,8 @@ def parse_args():
         help="samples to train on per env step. auto-adjusts to batch-size and num-envs. default of 8 is equivalent of train-frequency=4, batch-size=32, num-envs=1")
     parser.add_argument("--eval-episodes", type=int, default=20,
         help="number of evaluation episides/environments")
+    parser.add_argument("--final-eval-eps", type=int, default=100,
+        help="number of final evaluation episides/environments")
     parser.add_argument("--eval-frequency", type=int, default=25_000,
         help="the frequency of evaluation")
     parser.add_argument("--eval-ema", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
@@ -119,7 +120,6 @@ def parse_args():
     args = parser.parse_args()
     # fmt: on
     return args
-
 
 # ALGO LOGIC: initialize agent here:
 class QNetwork(BasePolicy):
@@ -194,6 +194,7 @@ if __name__ == "__main__":
         episodic_life=True,
         reward_clip=True,
         seed=args.seed,
+        num_threads=num_cpus() if args.num_threads is None else min(args.num_threads, num_cpus())
     )
     envs.num_envs = args.num_envs
     envs.single_action_space = envs.action_space
@@ -202,11 +203,9 @@ if __name__ == "__main__":
     assert isinstance(envs.action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
     # env eval setup
-    eval_env = envpool.make(args.env_id, env_type="gym", num_envs=args.eval_episodes, seed=args.seed)
-    eval_env.spec.id = args.env_id
-    eval_env = VecAdapter(eval_env)
-    eval_env = VecMonitor(eval_env)
+    eval_env = get_eval_env(args.env_id, "gym", args.eval_episodes, args.seed, num_threads=args.num_threads)
     dqn_eval = DQN(CnnPolicy, eval_env, buffer_size=1)
+    eval_env.close()
 
     # setup network
     q_network = QNetwork(envs, args.dropout).to(device)
@@ -291,7 +290,7 @@ if __name__ == "__main__":
         # TRY NOT TO MODIFY: save data to reply buffer
         rb.add(obs, real_next_obs, actions, rewards, dones.to(device), infos)
 
-        # TRY NOT TO MODIFY: record SB3 style rewards for plotting purposes
+        # record SB3 style rewards for plotting purposes
         if global_step % log_frequency == 0 and global_step > 0:
             if args.track:
                 if len(reward_queue) > 0:
@@ -338,7 +337,7 @@ if __name__ == "__main__":
                     scheduler.step()
                 optimizer.zero_grad()
 
-                # TRY NOT TO MODIFY: record losses for plotting purposes
+                # record losses for plotting purposes
                 smooth_loss = torch.lerp(loss.float(), smooth_loss, beta)
                 smooth_q    = torch.lerp(pred.mean().float(), smooth_q, beta)
                 loss_count += 1
@@ -359,8 +358,7 @@ if __name__ == "__main__":
                            "train/smooth_q_values": smooth_q.cpu()/(1-0.98**loss_count),
                            "train/model_updates": loss_count}, step=global_step)
 
-        # TRY NOT TO MODIFY: record frames per second for plotting purposes
-        # TRY NOT TO MODIFY: record frames per second for plotting purposes
+        # record frames per second for plotting purposes
         finish_time = time.time() 
         if global_step % log_frequency == 0:
             if args.track:
@@ -373,20 +371,30 @@ if __name__ == "__main__":
                 else:
                     wandb.log({"time/fps": total_fps}, step=global_step)
 
+        # evaluate model
         if global_step % eval_frequency == 0 and loss_count > 0:
             eval_start = time.time()
+            dqn_eval.policy.q_net.eval()
+            eval_env = get_eval_env(args.env_id, "gym", args.eval_episodes, args.seed, num_threads=args.num_threads)
             mean_reward, std_reward, mean_ep_length, std_ep_length, _ = evaluate_sb3(dqn_eval, eval_env, args.eval_episodes, args.track, global_step)
             print(f"    Mean Reward: {mean_reward:>7.2f}  ± {std_reward:>7.2f}       Mean Ep Len: {mean_ep_length:>7.2f}  ± {std_ep_length:>7.2f}   Step: {global_step:>8}")
             if args.eval_ema:
                 dqn_eval.policy.q_net = target_network.module
-                mean_reward, std_reward, mean_ep_length, std_ep_length, _ = evaluate_sb3(dqn_eval, eval_env, args.eval_episodes, args.track, global_step, prefix='ema', log_time=False)
+                dqn_eval.policy.q_net.eval()
+                eval_env.close()
+                eval_env = get_eval_env(args.env_id, "gym", args.eval_episodes, args.seed, num_threads=args.num_threads)
+                mean_reward, std_reward, mean_ep_length, std_ep_length, _ = evaluate_sb3(dqn_eval, eval_env, args.eval_episodes, args.track, global_step, prefix='ema_', log_time=False)
                 print(f"EMA Mean Reward: {mean_reward:>7.2f}  ± {std_reward:>7.2f}   EMA Mean Ep Len: {mean_ep_length:>7.2f}  ± {std_ep_length:>7.2f}   Step: {global_step:>8}")
                 dqn_eval.policy.q_net = q_network
                 target_network.module.eval()
             eval_time += time.time() - eval_start
+            eval_env.close()
 
-    # final eval
-    mean_reward, std_reward, mean_ep_length, std_ep_length, _ = evaluate_sb3(dqn_eval, eval_env, args.eval_episodes, args.track, global_step)
+    # final eval, adds an extra step on W&B to prevent double plotting
+    dqn_eval.policy.q_net.eval()
+    eval_env.close()
+    eval_env = get_eval_env(args.env_id, "gym", args.final_eval_eps, args.seed, num_threads=args.num_threads)
+    mean_reward, std_reward, mean_ep_length, std_ep_length, _ = evaluate_sb3(dqn_eval, eval_env, args.final_eval_eps, args.track, global_step+1)
     print(f"    Mean Reward: {mean_reward:>7.2f}  ± {std_reward:>7.2f}       Mean Ep Len: {mean_ep_length:>7.2f}  ± {std_ep_length:>7.2f}   Step: {global_step:>8}")
 
     path = Path(args.save_folder)
@@ -395,9 +403,12 @@ if __name__ == "__main__":
 
     if args.eval_ema:
         dqn_eval.policy.q_net = target_network.module
-        mean_reward, std_reward, mean_ep_length, std_ep_length, _ = evaluate_sb3(dqn_eval, eval_env, args.eval_episodes, args.track, global_step, prefix='ema', log_time=False)
+        dqn_eval.policy.q_net.eval()
+        eval_env.close()
+        eval_env = get_eval_env(args.env_id, "gym", args.final_eval_eps, args.seed, num_threads=args.num_threads)
+        mean_reward, std_reward, mean_ep_length, std_ep_length, _ = evaluate_sb3(dqn_eval, eval_env, args.final_eval_eps, args.track, global_step+1, prefix='ema_', log_time=False)
         print(f"EMA Mean Reward: {mean_reward:>7.2f}  ± {std_reward:>7.2f}   EMA Mean Ep Len: {mean_ep_length:>7.2f}  ± {std_ep_length:>7.2f}   Step: {global_step:>8}")
         target_network.module.save(path/f"{run_name}_ema")
-
+        
     envs.close()
     eval_env.close()
