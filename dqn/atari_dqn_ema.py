@@ -390,11 +390,11 @@ if __name__ == "__main__":
             eval_time += time.time() - eval_start
             eval_env.close()
 
-    # final eval, adds an extra step on W&B to prevent double plotting
+    # final eval
     dqn_eval.policy.q_net.eval()
     eval_env.close()
     eval_env = get_eval_env(args.env_id, "gym", args.final_eval_eps, args.seed, num_threads=args.num_threads)
-    mean_reward, std_reward, mean_ep_length, std_ep_length, _ = evaluate_sb3(dqn_eval, eval_env, args.final_eval_eps, args.track, global_step+1)
+    mean_reward, std_reward, mean_ep_length, std_ep_length, _ = evaluate_sb3(dqn_eval, eval_env, args.final_eval_eps, args.track, global_step, prefix='final_')
     print(f"    Mean Reward: {mean_reward:>7.2f}  ± {std_reward:>7.2f}       Mean Ep Len: {mean_ep_length:>7.2f}  ± {std_ep_length:>7.2f}   Step: {global_step:>8}")
 
     path = Path(args.save_folder)
@@ -406,7 +406,7 @@ if __name__ == "__main__":
         dqn_eval.policy.q_net.eval()
         eval_env.close()
         eval_env = get_eval_env(args.env_id, "gym", args.final_eval_eps, args.seed, num_threads=args.num_threads)
-        mean_reward, std_reward, mean_ep_length, std_ep_length, _ = evaluate_sb3(dqn_eval, eval_env, args.final_eval_eps, args.track, global_step+1, prefix='ema_', log_time=False)
+        mean_reward, std_reward, mean_ep_length, std_ep_length, _ = evaluate_sb3(dqn_eval, eval_env, args.final_eval_eps, args.track, global_step+1, prefix='final_ema_', log_time=False)
         print(f"EMA Mean Reward: {mean_reward:>7.2f}  ± {std_reward:>7.2f}   EMA Mean Ep Len: {mean_ep_length:>7.2f}  ± {std_ep_length:>7.2f}   Step: {global_step:>8}")
         target_network.module.save(path/f"{run_name}_ema")
         
