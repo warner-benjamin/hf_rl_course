@@ -11,31 +11,31 @@ from stable_baselines3.common.vec_env.base_vec_env import VecEnvObs, VecEnvStepR
 from envpool.python.protocol import EnvPool
 
 
-# CleanRL wrapper for stats tracking
+# Modified CleanRL wrapper for stats tracking
 class RecordEpisodeStatistics(gym.Wrapper):
     def __init__(self, env, deque_size=100):
         super().__init__(env)
         self.num_envs = getattr(env, "num_envs", 1)
         self.episode_returns = None
         self.episode_lengths = None
-        # get if the env has lives
-        self.has_lives = False
-        env.reset()
-        info = env.step(np.zeros(self.num_envs, dtype=int))[-1]
-        if info["lives"].sum() > 0:
-            self.has_lives = True
+        self.has_lives = None
+        self.reset(reset_env=False)
 
-    def reset(self, **kwargs):
-        observations = super().reset(**kwargs)
+    def reset(self, reset_env=True, **kwargs):
         self.episode_returns = np.zeros(self.num_envs, dtype=np.float32)
         self.episode_lengths = np.zeros(self.num_envs, dtype=np.int32)
         self.lives = np.zeros(self.num_envs, dtype=np.int32)
         self.returned_episode_returns = np.zeros(self.num_envs, dtype=np.float32)
         self.returned_episode_lengths = np.zeros(self.num_envs, dtype=np.int32)
-        return observations
+        if reset_env: 
+            return super().reset(**kwargs)
 
     def step(self, action):
-        observations, rewards, dones, infos = super().step(action)
+        return self._record_step(*super().step(action))
+
+    def _record_step(self, observations, rewards, dones, infos):
+        if self.has_lives is None:
+            self.has_lives = infos["lives"].sum() > 0
         self.episode_returns += infos["reward"]
         self.episode_lengths += 1
         self.returned_episode_returns[:] = self.episode_returns
@@ -55,6 +55,14 @@ class RecordEpisodeStatistics(gym.Wrapper):
             dones,
             infos,
         )
+
+
+
+class EnvPoolRecordEpisodeStats(RecordEpisodeStatistics):
+    def recv(self, reset:bool=False, return_info:bool=True):
+        return self._record_step(*self.env.recv(reset, return_info))
+
+
 
 # EnvPool SB3 adaptor for evaluation
 class VecAdapter(VecEnvWrapper):

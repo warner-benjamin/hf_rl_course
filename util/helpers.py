@@ -60,15 +60,15 @@ def evaluate_sb3(model, env, eval_eps, track, step=None, prefix='', log_time=Tru
     return mean_reward, std_reward, mean_ep_length, std_ep_length, fps
 
 
-def get_optimizer(opt_name, parameters, lr, wd):
+def get_optimizer(opt_name, parameters, lr, wd, eps):
     if opt_name == 'Adam':
-        optimizer = optim.Adam(parameters, lr=lr, weight_decay=wd)
+        optimizer = optim.Adam(parameters, lr=lr, weight_decay=wd, eps=eps)
     elif opt_name == 'AdamW':
-        optimizer = optim.AdamW(parameters, lr=lr, weight_decay=wd)
+        optimizer = optim.AdamW(parameters, lr=lr, weight_decay=wd, eps=eps)
     elif opt_name == 'SGD':
         optimizer = optim.SGD(parameters, lr=lr, weight_decay=wd)
     elif opt_name == 'RMSprop':
-        optimizer = optim.RMSprop(parameters, lr=lr, weight_decay=wd)
+        optimizer = optim.RMSprop(parameters, lr=lr, weight_decay=wd, eps=eps)
     else:
         raise ValueError(f'Invalid optimizer, {opt_name} must be one of Adam, AdamW, SGD, or RMSprop')
     return optimizer

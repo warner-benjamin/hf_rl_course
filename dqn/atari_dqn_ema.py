@@ -15,6 +15,7 @@ import time
 from distutils.util import strtobool
 from contextlib import nullcontext
 from collections import deque
+from functools import partial
 from pathlib import Path
 
 import gym
@@ -25,8 +26,7 @@ import torch.nn.functional as F
 import torch.optim.lr_scheduler as lr_sched
 from torch.cuda.amp import autocast, GradScaler
 
-from stable_baselines3.dqn import DQN, CnnPolicy
-from stable_baselines3.common.policies import BasePolicy
+from stable_baselines3.dqn import DQN as SB3DQN, CnnPolicy
 
 import envpool
 
@@ -41,8 +41,9 @@ if __package__ is None:
     sys.path.insert(0, str(DIR.parent))
     __package__ = DIR.name
 
+from dqn.dqn_models import DQN
 from util.atari_buffer import TorchAtariReplayBuffer
-from util.env_wrappers import RecordEpisodeStatistics
+from util.env_wrappers import EnvPoolRecordEpisodeStats
 from util.helpers import linear_schedule, num_train_steps, evaluate_sb3, get_optimizer, get_eval_env, num_cpus
 
 
@@ -73,8 +74,12 @@ def parse_args():
         help="where to save the final model")
     parser.add_argument("--num-threads", type=int, default=None,
         help="number of cpu threads to use for envs, defaults to num_cpus")
+    parser.add_argument("--jit", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
+        help="whether to torch.jit.script the model")
 
     # Algorithm specific arguments
+    parser.add_argument("--model", type=str, default="DQN",
+        help="the dqn model type. upports 'DQN' & 'Dueling'")
     parser.add_argument("--env-id", type=str, default="SpaceInvaders-v5",
         help="the id of the environment")
     parser.add_argument("--num-envs", type=int, default=256,
@@ -87,8 +92,6 @@ def parse_args():
         help="the learning rate of the optimizer")
     parser.add_argument("--weight-decay", type=float, default=0,
         help="the weight decay of the optimizer")
-    parser.add_argument("--dropout", type=float, default=0.0,
-        help="dropout for the DQN model")
     parser.add_argument("--ema-decay", type=float, default=0.998,
         help="EMA for the DQN target model")
     parser.add_argument("--buffer-size", type=int, default=100_000,
@@ -117,46 +120,11 @@ def parse_args():
         help="whether to evaluate the EMA weights")
     parser.add_argument("--one-cycle", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="whether to use 1cycle policy scheduler")
+    parser.add_argument("--auto-eps", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
+        help="if true, set the optimizers epsilon to 5e-3/bs")
     args = parser.parse_args()
     # fmt: on
     return args
-
-# ALGO LOGIC: initialize agent here:
-class QNetwork(BasePolicy):
-    def __init__(self, env, drop, normalize=True):
-        super().__init__(None, None)
-        self.network = nn.Sequential(
-            nn.Conv2d(4, 32, 8, stride=4),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, 4, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, 3, stride=1),
-            nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(3136, 512),
-            nn.ReLU(),
-            nn.Dropout(p=drop),
-            nn.Linear(512, env.single_action_space.n),
-        )
-        self.normalize = True
-
-    def forward(self, x:torch.Tensor):
-        if self.normalize:
-            with torch.no_grad():
-                x = x / 255.0
-        return self.network(x)
-
-    ## Compatability with SB3 evaluate_policy
-    def set_training_mode(self, mode: bool) -> None:
-        self.train(mode)
-
-    @torch.jit.unused
-    def _predict(self, observation: torch.Tensor, deterministic: bool = True) -> torch.Tensor:
-        q_values = self.forward(observation)
-        # Greedy action
-        action = q_values.argmax(dim=1).reshape(-1)
-        return action
-
 
 
 if __name__ == "__main__":
@@ -199,21 +167,31 @@ if __name__ == "__main__":
     envs.num_envs = args.num_envs
     envs.single_action_space = envs.action_space
     envs.single_observation_space = envs.observation_space
-    envs = RecordEpisodeStatistics(envs)
+    envs = EnvPoolRecordEpisodeStats(envs)
     assert isinstance(envs.action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
     # env eval setup
     eval_env = get_eval_env(args.env_id, "gym", args.eval_episodes, args.seed, num_threads=args.num_threads)
-    dqn_eval = DQN(CnnPolicy, eval_env, buffer_size=1)
+    dqn_eval = SB3DQN(CnnPolicy, eval_env, buffer_size=1)
     eval_env.close()
 
+    if args.model == 'DQN':
+        QModel = DQN
+    elif args.model == 'Dueling':
+        QModel = partial(DQN, dueling=True)
+    else:
+        raise ValueError(f"Unsupported `model`: {args.model}")
+
     # setup network
-    q_network = QNetwork(envs, args.dropout).to(device)
+    q_network = QModel(envs.single_action_space.n).to(device)
     target_network = ModelEmaV2(q_network, args.ema_decay, device)
     target_network.module.eval()
+    if args.jit: 
+        q_network = torch.jit.script(q_network)
 
     # set the optimizer
-    optimizer = get_optimizer(args.optimizer, q_network.parameters(), lr=args.learning_rate, wd=args.weight_decay)
+    eps = 0.005/args.batch_size if args.auto_eps else 1e-8
+    optimizer = get_optimizer(args.optimizer, q_network.parameters(), lr=args.learning_rate, wd=args.weight_decay, eps=eps)
 
     dqn_eval.policy.q_net = q_network
 
@@ -243,6 +221,7 @@ if __name__ == "__main__":
         scheduler = None
 
     # TRY NOT TO MODIFY: start the game
+    env_id = np.arange(args.num_envs)
     obs = torch.from_numpy(envs.reset()).to(device)
     start_time = time.time()
     for global_step in range(0, args.total_timesteps, args.num_envs):
@@ -266,42 +245,8 @@ if __name__ == "__main__":
         else:
             actions = rand_actions
 
-        # play out the next step
-        next_obs, rewards, dones, infos = envs.step(actions)
-
-        # TRY NOT TO MODIFY: move results to GPU
-        next_obs = torch.from_numpy(next_obs).to(device)
-        actions = torch.from_numpy(actions).to(device)
-        rewards = torch.from_numpy(rewards).to(device)
-        dones = torch.from_numpy(dones)
-        real_next_obs = next_obs.clone()
-
-        # TRY NOT TO MODIFY: handle `terminal_observation` since it doesn't exist in envpool
-        if dones.any():
-            idxs = dones.nonzero().squeeze(1)
-            real_next_obs[idxs] = obs[idxs]
-            if len(idxs) > 1:
-                reward_queue.extend(infos['r'][idxs])
-                ep_len_queue.extend(infos['l'][idxs])
-            else:
-                reward_queue.append(infos['r'][idxs])
-                ep_len_queue.append(infos['l'][idxs])
-        
-        # TRY NOT TO MODIFY: save data to reply buffer
-        rb.add(obs, real_next_obs, actions, rewards, dones.to(device), infos)
-
-        # record SB3 style rewards for plotting purposes
-        if global_step % log_frequency == 0 and global_step > 0:
-            if args.track:
-                if len(reward_queue) > 0:
-                    wandb.log({"rollout/ep_rew_mean": np.array(reward_queue).mean(),
-                               "rollout/ep_len_mean": np.array(ep_len_queue).mean(),
-                               "rollout/exploration_rate": epsilon}, step=global_step)
-                else:
-                    wandb.log({"rollout/exploration_rate": epsilon}, step=global_step)
-
-        # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
-        obs = next_obs
+        # asynchronously play out the next steps   
+        envs.send(actions, env_id)
 
         # ALGO LOGIC: training.
         train, steps = num_train_steps(global_step, args.num_envs, args.samples_step, args.batch_size)
@@ -358,6 +303,46 @@ if __name__ == "__main__":
                            "train/smooth_q_values": smooth_q.cpu()/(1-0.98**loss_count),
                            "train/model_updates": loss_count}, step=global_step)
 
+        # catch the asynchronously played steps
+        next_obs, rewards, dones, infos = envs.recv()
+
+        # if the envpool num_envs==batch_size, then env_id will be in order
+        env_id = infos["env_id"]
+
+        # TRY NOT TO MODIFY: move results to GPU
+        next_obs = torch.from_numpy(next_obs).to(device)
+        actions = torch.from_numpy(actions).to(device)
+        rewards = torch.from_numpy(rewards).to(device)
+        dones = torch.from_numpy(dones)
+        real_next_obs = next_obs.clone()
+
+        # TRY NOT TO MODIFY: handle `terminal_observation` since it doesn't exist in envpool
+        if dones.any():
+            idxs = dones.nonzero().squeeze(1)
+            real_next_obs[idxs] = obs[idxs]
+            if len(idxs) > 1:
+                reward_queue.extend(infos['r'][idxs])
+                ep_len_queue.extend(infos['l'][idxs])
+            else:
+                reward_queue.append(infos['r'][idxs])
+                ep_len_queue.append(infos['l'][idxs])
+
+        # TRY NOT TO MODIFY: save data to reply buffer
+        rb.add(obs, real_next_obs, actions, rewards, dones.to(device), infos)
+
+        # record SB3 style rewards for plotting purposes
+        if global_step % log_frequency == 0 and global_step > 0:
+            if args.track:
+                if len(reward_queue) > 0:
+                    wandb.log({"rollout/ep_rew_mean": np.array(reward_queue).mean(),
+                               "rollout/ep_len_mean": np.array(ep_len_queue).mean(),
+                               "rollout/exploration_rate": epsilon}, step=global_step)
+                else:
+                    wandb.log({"rollout/exploration_rate": epsilon}, step=global_step)
+
+        # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
+        obs = next_obs
+
         # record frames per second for plotting purposes
         finish_time = time.time() 
         if global_step % log_frequency == 0:
@@ -395,6 +380,7 @@ if __name__ == "__main__":
     eval_env.close()
     eval_env = get_eval_env(args.env_id, "gym", args.final_eval_eps, args.seed, num_threads=args.num_threads)
     mean_reward, std_reward, mean_ep_length, std_ep_length, _ = evaluate_sb3(dqn_eval, eval_env, args.final_eval_eps, args.track, global_step, prefix='final_')
+    print(f'\nFinal Evaluation on {args.final_eval_eps} episodes:\n')
     print(f"    Mean Reward: {mean_reward:>7.2f}  ± {std_reward:>7.2f}       Mean Ep Len: {mean_ep_length:>7.2f}  ± {std_ep_length:>7.2f}   Step: {global_step:>8}")
 
     path = Path(args.save_folder)
