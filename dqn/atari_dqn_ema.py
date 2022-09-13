@@ -41,7 +41,7 @@ if __package__ is None:
     sys.path.insert(0, str(DIR.parent))
     __package__ = DIR.name
 
-from dqn.dqn_models import DQN
+from dqn.dqn_models import DQN, ImpalaLarge, ImpalaSmall
 from util.atari_buffer import TorchAtariReplayBuffer
 from util.env_wrappers import EnvPoolRecordEpisodeStats
 from util.helpers import linear_schedule, num_train_steps, evaluate_sb3, get_optimizer, get_eval_env, num_cpus
@@ -179,6 +179,12 @@ if __name__ == "__main__":
         QModel = DQN
     elif args.model == 'Dueling':
         QModel = partial(DQN, dueling=True)
+    elif args.model == 'ImpalaS':
+        QModel = ImpalaSmall
+    elif args.model == 'ImpalaL':
+        QModel = partial(ImpalaLarge, width=2)
+    elif args.model == 'ImpalaLD':
+        QModel = partial(ImpalaLarge, width=2, dueling=True)
     else:
         raise ValueError(f"Unsupported `model`: {args.model}")
 
@@ -224,7 +230,9 @@ if __name__ == "__main__":
     env_id = np.arange(args.num_envs)
     obs = torch.from_numpy(envs.reset()).to(device)
     start_time = time.time()
-    for global_step in range(0, args.total_timesteps, args.num_envs):
+
+    # Take an "extra" step as the model trains on one less step than the env steps
+    for global_step in range(0, args.total_timesteps+args.num_envs, args.num_envs):
 
         # Don't decrease epsilon-greedy until learning starts
         if global_step > args.learning_starts:
