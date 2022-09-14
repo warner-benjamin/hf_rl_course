@@ -73,6 +73,8 @@ def parse_args():
         help="number of cpu threads to use for envs, defaults to num_cpus")
     parser.add_argument("--jit", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="whether to torch.jit.script the model")
+    parser.add_argument("--channels-last", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
+        help="whether to torch.jit.script the model")
 
     # Algorithm specific arguments
     parser.add_argument("--model", type=str, default="DQN",
@@ -107,6 +109,8 @@ def parse_args():
         help="timestep to start learning")
     parser.add_argument("--samples-step", type=int, default=8,
         help="samples to train on per env step. auto-adjusts to batch-size and num-envs. default of 8 is equivalent of train-frequency=4, batch-size=32, num-envs=1")
+    parser.add_argument("--eval", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
+        help="evaluate during training")    
     parser.add_argument("--eval-episodes", type=int, default=20,
         help="number of evaluation episides/environments")
     parser.add_argument("--final-eval-eps", type=int, default=100,
@@ -117,13 +121,15 @@ def parse_args():
         help="whether to use 1cycle policy scheduler")
     parser.add_argument("--auto-eps", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if true, set the optimizers epsilon to 5e-3/bs")
-    args = parser.parse_args()
+    args, _ = parser.parse_known_args()
     # fmt: on
     return args
 
 
-if __name__ == "__main__":
-    args = parse_args()
+def train(args, parse=False):
+    if parse:
+        args = parse_args()
+
     run_name = f"{args.env_id}_{args.exp_name}_{args.seed}_{int(time.time())}"
     if args.track:
         wandb.init(
@@ -132,7 +138,7 @@ if __name__ == "__main__":
             group=f'{args.group}_{args.env_id}',
             config=vars(args),
             name=run_name,
-            monitor_gym=True,
+            monitor_gym=False,
             save_code=True
         )
 
@@ -184,8 +190,9 @@ if __name__ == "__main__":
         raise ValueError(f"Unsupported `model`: {args.model}")
 
     # setup network
-    q_network = QModel(envs.single_action_space.n).to(device)
-    target_network = QModel(envs.single_action_space.n).to(device)
+    memory_format = torch.channels_last if args.channels_last else torch.contiguous_format
+    q_network = QModel(envs.single_action_space.n).to(device, memory_format=memory_format)
+    target_network = QModel(envs.single_action_space.n).to(device, memory_format=memory_format)
     if args.jit: 
         q_network = torch.jit.script(q_network)
         target_network = torch.jit.script(target_network)
@@ -365,8 +372,8 @@ if __name__ == "__main__":
                 else:
                     wandb.log({"time/fps": total_fps}, step=global_step)
 
-        # evaluate model
-        if global_step % eval_frequency == 0 and loss_count > 0:
+        # evaluate during training
+        if args.eval and global_step % eval_frequency == 0 and loss_count > 0:
             eval_start = time.time()
             dqn_eval.policy.q_net.eval()
             eval_env = get_eval_env(args.env_id, "gym", args.eval_episodes, args.seed, num_threads=args.num_threads)
@@ -381,10 +388,15 @@ if __name__ == "__main__":
     eval_env = get_eval_env(args.env_id, "gym", args.final_eval_eps, args.seed, num_threads=args.num_threads)
     mean_reward, std_reward, mean_ep_length, std_ep_length, _ = evaluate_sb3(dqn_eval, eval_env, args.final_eval_eps, args.track, global_step, prefix='final_')
     print(f'\nFinal Evaluation on {args.final_eval_eps} episodes:\n')
-    print(f"Mean Reward: {mean_reward:>7.2f}  ± {std_reward:>7.2f}   Mean Ep Len: {mean_ep_length:>7.2f}  ± {std_ep_length:>7.2f}   Step: {global_step:>8}")
+    print(f"Mean Reward: {mean_reward:>7.2f}  ± {std_reward:>7.2f}   Mean Ep Len: {mean_ep_length:>7.2f}  ± {std_ep_length:>7.2f}   Step: {global_step:>8}\n")
 
     path = Path(args.save_folder)
     path.mkdir(exist_ok=True)
     q_network.save(path/run_name)
     envs.close()
     eval_env.close()
+    if args.track:
+        wandb.finish()
+
+if __name__ == "__main__":
+    train(None, True)

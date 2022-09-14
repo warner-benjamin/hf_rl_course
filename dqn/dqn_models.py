@@ -220,3 +220,24 @@ class ImpalaLarge(nn.Module, SB3Compat):
             return state_value + action_score_centered
         else:
             return action_value
+
+
+
+class DQN_MLP(nn.Module, SB3Compat):
+    def __init__(self, n_actions, c_in):
+        super().__init__()
+        if isinstance(n_actions, tuple): 
+            n_actions = n_actions[0]
+        if isinstance(c_in, tuple): 
+            c_in = c_in[0]
+        self.n_actions, self.c_in = n_actions, c_in
+        self.network =  nn.Sequential(
+            nn.Linear(c_in, 120),
+            nn.ReLU(),
+            nn.Linear(120, 84),
+            nn.ReLU(),
+            nn.Linear(84, n_actions),
+        )
+
+    def forward(self, x:torch.Tensor):
+        return self.network(x)
