@@ -20,7 +20,6 @@ from pathlib import Path
 import gym
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim.lr_scheduler as lr_sched
 from torch.cuda.amp import autocast, GradScaler
@@ -105,8 +104,6 @@ def parse_args():
         help="the ending epsilon for exploration")
     parser.add_argument("--exploration-fraction", type=float, default=0.10,
         help="the fraction of `total-timesteps` it takes from start-e to go end-e")
-    parser.add_argument("--learning-starts", type=int, default=80_000,
-        help="timestep to start learning")
     parser.add_argument("--samples-step", type=int, default=8,
         help="samples to train on per env step. auto-adjusts to batch-size and num-envs. default of 8 is equivalent of train-frequency=4, batch-size=32, num-envs=1")
     parser.add_argument("--eval", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
@@ -124,6 +121,33 @@ def parse_args():
     args, _ = parser.parse_known_args()
     # fmt: on
     return args
+
+
+def process_step(replay_buffer, obs, next_obs, actions, rewards, dones, infos, device, reward_queue=None, ep_len_queue=None):
+    # TRY NOT TO MODIFY: move results to GPU
+    next_obs = torch.from_numpy(next_obs).to(device)
+    actions = torch.from_numpy(actions).to(device)
+    rewards = torch.from_numpy(rewards).to(device)
+    dones = torch.from_numpy(dones)
+    real_next_obs = next_obs.clone()
+
+    # TRY NOT TO MODIFY: handle `terminal_observation` since it doesn't exist in envpool
+    if dones.any():
+        idxs = dones.nonzero().squeeze(1)
+        real_next_obs[idxs] = obs[idxs]
+
+        # Record rollout stats 
+        if reward_queue is not None:
+            if len(idxs) > 1:
+                reward_queue.extend(infos['r'][idxs])
+                ep_len_queue.extend(infos['l'][idxs])
+            else:
+                reward_queue.append(infos['r'][idxs])
+                ep_len_queue.append(infos['l'][idxs])
+
+    # TRY NOT TO MODIFY: save data to reply buffer
+    replay_buffer.add(obs, real_next_obs, actions, rewards, dones.to(device), infos)
+    return next_obs
 
 
 def train(args, parse=False):
@@ -205,7 +229,7 @@ def train(args, parse=False):
 
     dqn_eval.policy.q_net = q_network
 
-    rb = TorchAtariReplayBuffer(
+    replay_buffer = TorchAtariReplayBuffer(
         args.buffer_size,
         envs.single_observation_space,
         envs.single_action_space,
@@ -215,17 +239,16 @@ def train(args, parse=False):
         n_envs=args.num_envs
     )
 
-    train_steps, num_timesteps_phase, eval_time, loss_count, target_count, target_updated = 0, 0, 0, 0, 0, 0
+    train_steps, eval_time, loss_count, total_train_time, target_count, target_updated = 0, 0, 0, 0, 0, 0
     smooth_loss, smooth_q, beta =  torch.tensor(0., device=device), torch.tensor(0., device=device), torch.tensor(0.98, device=device)
     reward_queue, ep_len_queue = deque(maxlen=100), deque(maxlen=100)
-    started_learning = False
 
     log_frequency = args.num_envs*int(args.log_frequency/args.num_envs) if int(args.log_frequency/args.num_envs) > 0 else args.num_envs
     eval_frequency = args.num_envs*int(args.eval_frequency/args.num_envs) if int(args.eval_frequency/args.num_envs) > 0 else args.eval_frequency
 
     if args.one_cycle:
         _, steps = num_train_steps(0, args.num_envs, args.samples_step, args.batch_size)
-        training_steps = steps*int(1+(args.total_timesteps-args.learning_starts)/args.num_envs+1)
+        training_steps = steps*int(1+args.total_timesteps/args.num_envs)
         scheduler = lr_sched.OneCycleLR(optimizer, max_lr=args.learning_rate, steps_per_epoch=training_steps, pct_start=args.exploration_fraction, epochs=1)
     else: 
         scheduler = None
@@ -233,16 +256,24 @@ def train(args, parse=False):
     # TRY NOT TO MODIFY: start the game
     env_id = np.arange(args.num_envs)
     obs = torch.from_numpy(envs.reset()).to(device)
-    start_time = time.time()
 
-    # Take an "extra" step as the model trains on one less step than the env steps
+    # Pre-populate replay buffer with random steps
+    print("Pre-populating replay buffer")
+    for _ in range(0, args.buffer_size+args.num_envs, args.num_envs):
+        actions = nprng.integers(0, envs.single_action_space.n, envs.num_envs)
+        envs.send(actions, env_id)
+        next_obs, rewards, dones, infos = envs.recv()
+        env_id = infos["env_id"]
+        obs = process_step(replay_buffer, obs, next_obs, actions, rewards, dones, infos, device)
+
+    start_time = time.time()
+    print("Begin training")
+
+    # START TRAINING: Take an "extra" step as the model trains on one less step than the env steps
     for global_step in range(0, args.total_timesteps+args.num_envs, args.num_envs):
 
-        # Don't decrease epsilon-greedy until learning starts
-        if global_step > args.learning_starts:
-            epsilon = linear_schedule(args.start_e, args.end_e, args.exploration_fraction * args.total_timesteps, global_step-args.learning_starts)
-        else:
-            epsilon = args.start_e
+        # Decrease epsilon-greedy per schedule
+        epsilon = linear_schedule(args.start_e, args.end_e, args.exploration_fraction * args.total_timesteps, global_step)
         
         # ALGO LOGIC: take random actions, play observations, combine per epsilon greedy
         rand_actions = nprng.integers(0, envs.single_action_space.n, envs.num_envs)
@@ -262,24 +293,19 @@ def train(args, parse=False):
 
         # ALGO LOGIC: training.
         train, steps = num_train_steps(global_step, args.num_envs, args.samples_step, args.batch_size)
-        if global_step > args.learning_starts and train:
-            # Reset time metrics for accurate training fps
-            if not started_learning:
-                started_learning = True
-                total_train_time = 0
-                start_time = time.time()
-                num_timesteps_phase = global_step - args.num_envs
-            train_start = time.time()
-
+        if train:
             # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
             q_network.train()
+            train_start = time.time()
+
+            # Train model for steps
             for r in range(steps):
-                data = rb.sample(args.batch_size)
+                t_obs, t_actions, t_nxt_obs, t_dones, t_rewards = replay_buffer.sample(args.batch_size)
                 with ac:
                     with torch.no_grad():
-                        target_max, _ = target_network(data.next_observations).max(dim=1)
-                        td_target = data.rewards.flatten() + args.gamma * target_max * (1 - data.dones.float().flatten())
-                    pred = q_network(data.observations).gather(1, data.actions).squeeze()
+                        target_max, _ = target_network(t_nxt_obs).max(dim=1)
+                        td_target = t_rewards.flatten() + args.gamma * target_max * (1 - t_dones.float().flatten())
+                    pred = q_network(t_obs).gather(1, t_actions).squeeze()
                     loss = F.mse_loss(td_target, pred)
 
                 # optimize the model
@@ -290,6 +316,7 @@ def train(args, parse=False):
                 else:
                     loss.backward()
                     optimizer.step()
+
                 if scheduler is not None: 
                     scheduler.step()
                 optimizer.zero_grad()
@@ -325,28 +352,10 @@ def train(args, parse=False):
         # if the envpool num_envs==batch_size, then env_id will be in order
         env_id = infos["env_id"]
 
-        # TRY NOT TO MODIFY: move results to GPU
-        next_obs = torch.from_numpy(next_obs).to(device)
-        actions = torch.from_numpy(actions).to(device)
-        rewards = torch.from_numpy(rewards).to(device)
-        dones = torch.from_numpy(dones)
-        real_next_obs = next_obs.clone()
+        # TRY NOT TO MODIFY: move results to replay buffer and set obs as next_obs
+        obs = process_step(replay_buffer, obs, next_obs, actions, rewards, dones, infos, device, reward_queue, ep_len_queue)
 
-        # TRY NOT TO MODIFY: handle `terminal_observation` since it doesn't exist in envpool
-        if dones.any():
-            idxs = dones.nonzero().squeeze(1)
-            real_next_obs[idxs] = obs[idxs]
-            if len(idxs) > 1:
-                reward_queue.extend(infos['r'][idxs])
-                ep_len_queue.extend(infos['l'][idxs])
-            else:
-                reward_queue.append(infos['r'][idxs])
-                ep_len_queue.append(infos['l'][idxs])
-
-        # TRY NOT TO MODIFY: save data to reply buffer
-        rb.add(obs, real_next_obs, actions, rewards, dones.to(device), infos)
-
-        # record SB3 style rewards for plotting purposes
+        # record SB3 style rollout for logging purposes
         if global_step % log_frequency == 0 and global_step > 0:
             if args.track:
                 if len(reward_queue) > 0:
@@ -356,21 +365,16 @@ def train(args, parse=False):
                 else:
                     wandb.log({"rollout/exploration_rate": epsilon}, step=global_step)
 
-        # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
-        obs = next_obs
-
         # record frames per second for plotting purposes
-        finish_time = time.time() 
         if global_step % log_frequency == 0:
             if args.track:
                 time_elapsed = time.time() - start_time - eval_time
-                total_fps = int((global_step - num_timesteps_phase) / time_elapsed)
-                if global_step > args.learning_starts and train:
-                    wandb.log({"time/fps": total_fps,
+                if train:
+                    wandb.log({"time/fps": int(global_step / time_elapsed),
                                "time/train_fps": int(train_steps / total_train_time),
-                               "time/play_fps": int((global_step - num_timesteps_phase) / (time_elapsed - total_train_time))}, step=global_step)
+                               "time/play_fps":  int(global_step / (time_elapsed - total_train_time))}, step=global_step)
                 else:
-                    wandb.log({"time/fps": total_fps}, step=global_step)
+                    wandb.log({"time/fps": int(global_step / time_elapsed)}, step=global_step)
 
         # evaluate during training
         if args.eval and global_step % eval_frequency == 0 and loss_count > 0:

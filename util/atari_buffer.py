@@ -142,7 +142,7 @@ class TorchAtariReplayBuffer(BaseBuffer):
             self.full = True
             self.pos = 0
 
-    def sample(self, batch_size: int, env: Optional[VecNormalize] = None) -> ReplayBufferSamples:
+    def sample(self, batch_size: int, env: Optional[VecNormalize] = None):
         """
         Sample elements from the replay buffer.
         Custom sampling when using memory efficient variant,
@@ -164,7 +164,7 @@ class TorchAtariReplayBuffer(BaseBuffer):
             batch_inds = torch.randint(0, self.pos, size=batch_size)
         return self._get_samples(batch_inds, env=env)
 
-    def _get_samples(self, batch_inds: torch.Tensor, env: Optional[VecNormalize] = None) -> ReplayBufferSamples:
+    def _get_samples(self, batch_inds: torch.Tensor, env: Optional[VecNormalize] = None):
         # Sample randomly the env idx
         env_indices = torch.randint(0, high=self.n_envs, size=(len(batch_inds),))
 
@@ -178,14 +178,10 @@ class TorchAtariReplayBuffer(BaseBuffer):
                 next_obs = self._normalize_obs(next_obs, env)
 
         obs = self.observations[batch_inds, env_indices, :]
+        obs = self._normalize_obs(obs, env) if self.normalize else obs
+        actions = self.actions[batch_inds, env_indices, :]
+        dones = (self.dones[batch_inds, env_indices].int() * (1 - self.timeouts[batch_inds, env_indices].int())).view(-1, 1)
         rewards = self.rewards[batch_inds, env_indices].view(-1, 1)
-        data = (
-            self._normalize_obs(obs, env) if self.normalize else obs,
-            self.actions[batch_inds, env_indices, :],
-            next_obs,
-            # Only use dones that are not due to timeouts
-            # deactivated by default (timeouts is initialized as an array of False)
-            (self.dones[batch_inds, env_indices].int() * (1 - self.timeouts[batch_inds, env_indices].int())).view(-1, 1),
-            self._normalize_reward(rewards, env) if self.normalize else rewards,
-        )
-        return ReplayBufferSamples(*data)
+        rewards = self._normalize_reward(rewards, env) if self.normalize else rewards
+        
+        return obs, actions, next_obs, dones, rewards

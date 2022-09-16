@@ -3,6 +3,7 @@
 # EnvPool - Apache License 2.0 - Copyright (c) 2022 Garena Online Private Limited
 
 import gym
+import torch
 import numpy as np
 
 from stable_baselines3.common.vec_env import VecEnvWrapper
@@ -13,7 +14,7 @@ from envpool.python.protocol import EnvPool
 
 # Modified CleanRL wrapper for stats tracking
 class RecordEpisodeStatistics(gym.Wrapper):
-    def __init__(self, env, deque_size=100):
+    def __init__(self, env):
         super().__init__(env)
         self.num_envs = getattr(env, "num_envs", 1)
         self.episode_returns = None
@@ -49,12 +50,7 @@ class RecordEpisodeStatistics(gym.Wrapper):
             self.episode_lengths *= 1 - dones
         infos["r"] = self.returned_episode_returns
         infos["l"] = self.returned_episode_lengths
-        return (
-            observations,
-            rewards,
-            dones,
-            infos,
-        )
+        return observations, rewards, dones, infos
 
 
 
