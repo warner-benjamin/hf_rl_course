@@ -307,7 +307,7 @@ def train(args, parse=False):
                 t_obs, t_actions, t_nxt_obs, t_dones, t_rewards = replay_buffer.sample(args.batch_size)
                 with ac:
                     with torch.no_grad():
-                        target_max, _ = target_network(t_nxt_obs).max(dim=1)
+                        target_max, _ = target_network.module(t_nxt_obs).max(dim=1)
                         td_target = t_rewards.flatten() + args.gamma * target_max * (1 - t_dones.float().flatten())
                     pred = q_network(t_obs).gather(1, t_actions).squeeze()
                     loss = F.mse_loss(td_target, pred)
