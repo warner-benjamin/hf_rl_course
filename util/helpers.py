@@ -10,6 +10,10 @@ from stable_baselines3.common.vec_env import VecMonitor
 from stable_baselines3.common.evaluation import evaluate_policy
 
 
+def lerp(start, end, weight):
+    return start + weight * (end - start)
+
+
 def num_cpus():
     try:
         return len(os.sched_getaffinity(0))

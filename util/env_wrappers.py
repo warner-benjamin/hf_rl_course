@@ -36,13 +36,13 @@ class RecordEpisodeStatistics(gym.Wrapper):
 
     def _record_step(self, observations, rewards, dones, infos):
         if self.has_lives is None:
-            self.has_lives = infos["lives"].sum() > 0
-        self.episode_returns += infos["reward"]
+            self.has_lives = infos.get('lives', np.array(0)).sum() > 0
+        self.episode_returns += rewards
         self.episode_lengths += 1
         self.returned_episode_returns[:] = self.episode_returns
         self.returned_episode_lengths[:] = self.episode_lengths
-        all_lives_exhausted = infos["lives"] == 0
         if self.has_lives:
+            all_lives_exhausted = infos["lives"] == 0
             self.episode_returns *= 1 - all_lives_exhausted
             self.episode_lengths *= 1 - all_lives_exhausted
         else:
@@ -57,6 +57,36 @@ class RecordEpisodeStatistics(gym.Wrapper):
 class EnvPoolRecordEpisodeStats(RecordEpisodeStatistics):
     def recv(self, reset:bool=False, return_info:bool=True):
         return self._record_step(*self.env.recv(reset, return_info))
+
+
+
+class RecordEpisodeStatisticsTorch(gym.Wrapper):
+    def __init__(self, env, device):
+        super().__init__(env)
+        self.num_envs = getattr(env, "num_envs", 1)
+        self.device = device
+        self.episode_returns = None
+        self.episode_lengths = None
+
+    def reset(self, reset_env=True, **kwargs):
+        self.episode_returns = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self.episode_lengths = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
+        self.returned_episode_returns = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self.returned_episode_lengths = torch.zeros(self.num_envs, dtype=torch.int32, device=self.device)
+        if reset_env:
+            return super().reset(**kwargs)
+
+    def step(self, action):
+        observations, rewards, dones, infos = super().step(action)
+        self.episode_returns += rewards
+        self.episode_lengths += 1
+        self.returned_episode_returns[:] = self.episode_returns
+        self.returned_episode_lengths[:] = self.episode_lengths
+        self.episode_returns *= 1 - dones
+        self.episode_lengths *= 1 - dones
+        infos["r"] = self.returned_episode_returns
+        infos["l"] = self.returned_episode_lengths
+        return observations, rewards, dones, infos
 
 
 
