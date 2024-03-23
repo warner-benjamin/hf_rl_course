@@ -13,10 +13,7 @@ class SB3Compat():
 
     @torch.jit.ignore
     def _predict(self, observation: torch.Tensor, deterministic: bool = True) -> torch.Tensor:
-        q_values = self.forward(observation)
-        # Greedy action
-        action = q_values.argmax(dim=1).reshape(-1)
-        return action
+        return self.get_action(observation)
 
     @torch.jit.ignore
     def _get_constructor_parameters(self):

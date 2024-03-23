@@ -38,9 +38,10 @@ if __package__ is None:
     __package__ = DIR.name
 
 from dqn.dqn_models import DQN, ImpalaLarge, ImpalaSmall
+from dqn.resnet_dqn import dqn_resnet9
 from util.atari_buffer import TorchAtariReplayBuffer
 from util.env_wrappers import EnvPoolRecordEpisodeStats
-from util.helpers import linear_schedule, num_train_steps, evaluate_sb3, get_optimizer, get_eval_env, num_cpus
+from util.helpers import linear_schedule, num_train_steps, evaluate_sb3, get_optimizer, get_eval_env, num_cpus, lerp
 
 
 def parse_args():
@@ -72,12 +73,16 @@ def parse_args():
         help="number of cpu threads to use for envs, defaults to num_cpus")
     parser.add_argument("--jit", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="whether to torch.jit.script the model")
+    parser.add_argument("--trace", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
+        help="whether to torch.jit.trace the model")
     parser.add_argument("--channels-last", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
+        help="whether to torch.jit.script the model")
+    parser.add_argument("--non-blocking", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="whether to torch.jit.script the model")
 
     # Algorithm specific arguments
     parser.add_argument("--model", type=str, default="DQN",
-        help="the dqn model type. upports 'DQN' & 'Dueling'")
+        help="the dqn model type. supports 'DQN' & 'Dueling'")
     parser.add_argument("--env-id", type=str, default="SpaceInvaders-v5",
         help="the id of the environment")
     parser.add_argument("--num-envs", type=int, default=256,
@@ -123,11 +128,11 @@ def parse_args():
     return args
 
 
-def process_step(replay_buffer, obs, next_obs, actions, rewards, dones, infos, device, reward_queue=None, ep_len_queue=None):
+def process_step(replay_buffer, obs, next_obs, actions, rewards, dones, infos, device, reward_queue=None, ep_len_queue=None, non_blocking=True):
     # TRY NOT TO MODIFY: move results to GPU
-    next_obs = torch.from_numpy(next_obs).to(device)
-    actions = torch.from_numpy(actions).to(device)
-    rewards = torch.from_numpy(rewards).to(device)
+    next_obs = torch.from_numpy(next_obs).to(device, non_blocking=non_blocking)
+    actions = torch.from_numpy(actions).to(device, non_blocking=non_blocking)
+    rewards = torch.from_numpy(rewards).to(device, non_blocking=non_blocking)
     dones = torch.from_numpy(dones)
     real_next_obs = next_obs.clone()
 
@@ -146,7 +151,7 @@ def process_step(replay_buffer, obs, next_obs, actions, rewards, dones, infos, d
                 ep_len_queue.append(infos['l'][idxs])
 
     # TRY NOT TO MODIFY: save data to reply buffer
-    replay_buffer.add(obs, real_next_obs, actions, rewards, dones.to(device), infos)
+    replay_buffer.add(obs, real_next_obs, actions, rewards, dones.to(device, non_blocking=non_blocking), infos)
     return next_obs
 
 
@@ -210,6 +215,14 @@ def train(args, parse=False):
         QModel = partial(ImpalaLarge, width=2)
     elif args.model == 'ImpalaLD':
         QModel = partial(ImpalaLarge, width=2, dueling=True)
+    elif args.model == 'ResNet':
+        QModel = dqn_resnet9
+    elif args.model == 'ResNetD':
+        QModel = partial(dqn_resnet9, dueling=True)
+    elif args.model == 'ResNetB':
+        QModel = partial(dqn_resnet9, norm='batch')
+    elif args.model == 'ResNetBD':
+        QModel = partial(dqn_resnet9, dueling=True, norm='batch')
     else:
         raise ValueError(f"Unsupported `model`: {args.model}")
 
@@ -220,6 +233,9 @@ def train(args, parse=False):
     if args.jit: 
         q_network = torch.jit.script(q_network)
         target_network = torch.jit.script(target_network)
+    if args.trace:
+        q_network = torch.jit.trace(q_network, torch.randn([args.batch_size, 4, 84, 84], device=args.device))
+        target_network = torch.jit.trace(target_network, torch.randn([args.batch_size, 4, 84, 84], device=args.device))    
     target_network.eval()
     target_network.load_state_dict(q_network.state_dict())
 
@@ -239,7 +255,7 @@ def train(args, parse=False):
         n_envs=args.num_envs
     )
 
-    train_steps, eval_time, loss_count, total_train_time, target_count, target_updated = 0, 0, 0, 0, 0, 0
+    train_steps, loss_count, target_count, target_updated, fps, train_fps, steps = 0, 0, 0, 0, 0, 0, 0
     smooth_loss, smooth_q, beta =  torch.tensor(0., device=device), torch.tensor(0., device=device), torch.tensor(0.98, device=device)
     reward_queue, ep_len_queue = deque(maxlen=100), deque(maxlen=100)
 
@@ -259,18 +275,19 @@ def train(args, parse=False):
 
     # Pre-populate replay buffer with random steps
     print("Pre-populating replay buffer")
-    for _ in range(0, args.buffer_size+args.num_envs, args.num_envs):
-        actions = nprng.integers(0, envs.single_action_space.n, envs.num_envs)
-        envs.send(actions, env_id)
-        next_obs, rewards, dones, infos = envs.recv()
-        env_id = infos["env_id"]
-        obs = process_step(replay_buffer, obs, next_obs, actions, rewards, dones, infos, device)
-
     start_time = time.time()
-    print("Begin training")
+    for s in range(0, args.buffer_size+args.num_envs, args.num_envs):
+        actions = nprng.integers(0, envs.single_action_space.n, envs.num_envs)
+        next_obs, rewards, dones, infos = envs.step(actions)
+        env_id = infos["env_id"]
+        obs = process_step(replay_buffer, obs, next_obs, actions, rewards, dones, infos, device, non_blocking=args.non_blocking)
+    if args.track: wandb.log({"time/populate_fps": int(s+args.num_envs)/(time.time() - start_time)}, step=0)
 
+    print("Begin training")
     # START TRAINING: Take an "extra" step as the model trains on one less step than the env steps
     for global_step in range(0, args.total_timesteps+args.num_envs, args.num_envs):
+        steps += 1
+        start_time = time.time()
 
         # Decrease epsilon-greedy per schedule
         epsilon = linear_schedule(args.start_e, args.end_e, args.exploration_fraction * args.total_timesteps, global_step)
@@ -288,18 +305,18 @@ def train(args, parse=False):
         else:
             actions = rand_actions
 
-        # asynchronously play out the next steps   
+        # asynchronously play out the next steps
         envs.send(actions, env_id)
 
         # ALGO LOGIC: training.
-        train, steps = num_train_steps(global_step, args.num_envs, args.samples_step, args.batch_size)
+        train, train_steps = num_train_steps(global_step, args.num_envs, args.samples_step, args.batch_size)
         if train:
             # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
             q_network.train()
             train_start = time.time()
 
             # Train model for steps
-            for r in range(steps):
+            for r in range(train_steps):
                 t_obs, t_actions, t_nxt_obs, t_dones, t_rewards = replay_buffer.sample(args.batch_size)
                 with ac:
                     with torch.no_grad():
@@ -326,7 +343,6 @@ def train(args, parse=False):
                 smooth_q    = torch.lerp(pred.mean().float(), smooth_q, beta)
                 loss_count += 1
                 target_count += int(args.batch_size/args.samples_step)
-                train_steps += args.batch_size
 
                 # update the target network
                 if target_count >= args.target_network_frequency:
@@ -334,17 +350,8 @@ def train(args, parse=False):
                     target_updated += 1
                     target_count = 0
                     if args.track: wandb.log({"train/target_updated": target_updated}, step=global_step)
-            train_finish = time.time()
-            total_train_time += train_finish - train_start
 
-        if global_step % log_frequency == 0 and loss_count > 0:
-            smooth_val = smooth_loss.cpu()/(1-0.98**loss_count)
-            if args.track:
-                wandb.log({"train/loss": loss,
-                           "train/smooth_loss": smooth_val,
-                           "train/q_values": pred.mean(),
-                           "train/smooth_q_values": smooth_q.cpu()/(1-0.98**loss_count),
-                           "train/model_updates": loss_count}, step=global_step)
+            train_time = time.time() - train_start
 
         # catch the asynchronously played steps
         next_obs, rewards, dones, infos = envs.recv()
@@ -353,37 +360,37 @@ def train(args, parse=False):
         env_id = infos["env_id"]
 
         # TRY NOT TO MODIFY: move results to replay buffer and set obs as next_obs
-        obs = process_step(replay_buffer, obs, next_obs, actions, rewards, dones, infos, device, reward_queue, ep_len_queue)
+        obs = process_step(replay_buffer, obs, next_obs, actions, rewards, dones, infos, device, reward_queue, ep_len_queue,non_blocking=args.non_blocking)
 
-        # record SB3 style rollout for logging purposes
-        if global_step % log_frequency == 0 and global_step > 0:
-            if args.track:
-                if len(reward_queue) > 0:
-                    wandb.log({"rollout/ep_rew_mean": np.array(reward_queue).mean(),
-                               "rollout/ep_len_mean": np.array(ep_len_queue).mean(),
-                               "rollout/exploration_rate": epsilon}, step=global_step)
-                else:
-                    wandb.log({"rollout/exploration_rate": epsilon}, step=global_step)
+        # lerp fps results starting on second step as first step can take significantly longer due to warmup
+        if steps > 1:
+            fps = lerp(args.num_envs/(time.time()-start_time), fps, 0.98)
+            train_fps = lerp((train_steps*args.batch_size)/train_time, train_fps, 0.98)
+        else:
+            fps = args.num_envs/(time.time()-start_time)
+            train_fps = (train_steps*args.batch_size)/train_time
 
-        # record frames per second for plotting purposes
-        if global_step % log_frequency == 0:
-            if args.track:
-                time_elapsed = time.time() - start_time - eval_time
-                if train:
-                    wandb.log({"time/fps": int(global_step / time_elapsed),
-                               "time/train_fps": int(train_steps / total_train_time),
-                               "time/play_fps":  int(global_step / (time_elapsed - total_train_time))}, step=global_step)
-                else:
-                    wandb.log({"time/fps": int(global_step / time_elapsed)}, step=global_step)
+        # record losses, SB3 style rollout, and training fps
+        if args.track and global_step % log_frequency == 0:
+            log = {"train/loss": loss,
+                   "train/smooth_loss": smooth_loss/(1-0.98**loss_count),
+                   "train/q_values": pred.mean(),
+                   "train/smooth_q_values": smooth_q/(1-0.98**loss_count),
+                   "train/model_updates": loss_count,
+                   "rollout/exploration_rate": epsilon,
+                   "time/fps": int(fps/(1-0.98**steps)),
+                   "time/train_fps": int(train_fps/(1-0.98**steps))}
+            if len(ep_len_queue) > 0:
+                log.update({"rollout/ep_rew_mean": np.array(reward_queue).mean(),
+                            "rollout/ep_len_mean": np.array(ep_len_queue).mean()})
+            wandb.log(log, step=global_step)
 
         # evaluate during training
         if args.eval and global_step % eval_frequency == 0 and loss_count > 0:
-            eval_start = time.time()
             dqn_eval.policy.q_net.eval()
             eval_env = get_eval_env(args.env_id, "gym", args.eval_episodes, args.seed, num_threads=args.num_threads)
             mean_reward, std_reward, mean_ep_length, std_ep_length, _ = evaluate_sb3(dqn_eval, eval_env, args.eval_episodes, args.track, global_step)
             print(f"Mean Reward: {mean_reward:>7.2f}  ± {std_reward:>7.2f}   Mean Ep Len: {mean_ep_length:>7.2f}  ± {std_ep_length:>7.2f}   Step: {global_step:>8}")
-            eval_time += time.time() - eval_start
             eval_env.close()
 
     # final eval

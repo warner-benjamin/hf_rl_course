@@ -35,7 +35,7 @@ if __package__ is None:
     sys.path.insert(0, str(DIR.parent))
     __package__ = DIR.name
 
-from ppo.ppo_models import AtariPPO
+from ppo.ppo_models import AtariPPOs, AtariPPO
 from util.env_wrappers import EnvPoolRecordEpisodeStats
 from util.helpers import evaluate_sb3, get_optimizer, get_eval_env, num_cpus, lerp
 
@@ -91,8 +91,8 @@ def parse_args():
         help="the weight decay of the optimizer")
     parser.add_argument("--num-envs", type=int, default=16,
         help="the number of parallel game environments")
-    parser.add_argument("--num-steps", type=int, default=128,
-        help="the number of steps to run in each environment per policy rollout")
+    parser.add_argument("--batch-size", type=int, default=2048,
+        help="the total number of steps to run across all environments per policy rollout")
     parser.add_argument("--anneal-lr", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="Toggle learning rate annealing for policy and value networks")
     parser.add_argument("--gae", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
@@ -101,8 +101,8 @@ def parse_args():
         help="the discount factor gamma")
     parser.add_argument("--gae-lambda", type=float, default=0.95,
         help="the lambda for the general advantage estimation")
-    parser.add_argument("--num-minibatches", type=int, default=8,
-        help="the number of mini-batches")
+    parser.add_argument("--minibatch-size", type=int, default=128,
+        help="the size of the policy update mini-batches")
     parser.add_argument("--update-epochs", type=int, default=3,
         help="the K epochs to update the policy")
     parser.add_argument("--norm-adv", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
@@ -132,8 +132,10 @@ def parse_args():
     parser.add_argument("--auto-eps", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if true, set the optimizers epsilon to 5e-3/bs")
     args, _ = parser.parse_known_args()
-    args.batch_size = int(args.num_envs * args.num_steps)
-    args.minibatch_size = int(args.batch_size // args.num_minibatches)
+    assert args.batch_size >= args.num_envs, 'batch_size mubs be greater or equal to num_envs'
+    assert args.batch_size >= args.minibatch_size, 'batch_size mubs be greater or equal to minibatch_size'
+    args.num_steps = int(args.batch_size / args.num_envs)
+    args.num_minibatches = int(args.batch_size / args.minibatch_size)
     # fmt: on
     return args
 
@@ -188,7 +190,9 @@ def train(args, parse=False):
     ppo_eval = SB3PPO(CnnPolicy, eval_env)
     eval_env.close()
 
-    if args.model == 'PPO':
+    if args.model == 'PPOs':
+        PPOModel = AtariPPOs
+    elif args.model == 'PPO':
         PPOModel = AtariPPO
     else:
         raise ValueError(f"Unsupported `model`: {args.model}")

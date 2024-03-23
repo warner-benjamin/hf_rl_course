@@ -24,8 +24,19 @@ if __package__ is None:
 from util.sb3compat import SB3Compat
 
 
+class DQNBase(nn.Module):
+    def norm(self, x):
+        if self.normalize:
+            with torch.no_grad():
+                return x / 255.0
+        else:
+            return x
 
-class DQN(nn.Module, SB3Compat):
+    def get_action(self, x:torch.Tensor):
+        return self.forward(x).argmax(dim=1).reshape(-1)
+
+
+class DQN(DQNBase, SB3Compat):
     def __init__(self, n_actions, dueling=False, c_in=4, normalize=True, act_cls=nn.ReLU):
         super().__init__()
         self.n_actions, self.dueling = n_actions, dueling
@@ -51,11 +62,7 @@ class DQN(nn.Module, SB3Compat):
         )
 
     def forward(self, x:torch.Tensor):
-        if self.normalize:
-            with torch.no_grad():
-                x = x / 255.0
-
-        x = self.network(x)
+        x = self.network(self.norm(x))
         action_value = self.action_value(x)
         if self.dueling:
             state_value = self.state_value(x)
@@ -67,7 +74,7 @@ class DQN(nn.Module, SB3Compat):
 
 
 
-class ImpalaSmall(nn.Module, SB3Compat):
+class ImpalaSmall(DQNBase, SB3Compat):
     """
     Implementation of the small variant of the IMPALA CNN introduced in Espeholt et al. (2018).
     """
@@ -96,10 +103,7 @@ class ImpalaSmall(nn.Module, SB3Compat):
         )
 
     def forward(self, x):
-        if self.normalize:
-            with torch.no_grad():
-                x = x / 255.0
-        x = self.main(x)
+        x = self.main(self.norm(x))
         x = self.flatten(self.pool(x))
         action_value = self.action_value(x)
         if self.dueling:
@@ -148,7 +152,7 @@ class ImpalaBlock(nn.Module):
         return x
 
 
-class ImpalaLarge(nn.Module, SB3Compat):
+class ImpalaLarge(DQNBase, SB3Compat):
     """
     Implementation of the large variant of the IMPALA CNN introduced in Espeholt et al. (2018).
     """
@@ -181,10 +185,7 @@ class ImpalaLarge(nn.Module, SB3Compat):
         )
 
     def forward(self, x):
-        if self.normalize:
-            with torch.no_grad():
-                x = x / 255.0
-        x = self.main(x)
+        x = self.main(self.norm(x))
         x = self.flatten(self.pool(x))
         action_value = self.action_value(x)
         if self.dueling:
@@ -196,7 +197,7 @@ class ImpalaLarge(nn.Module, SB3Compat):
 
 
 
-class DQN_MLP(nn.Module, SB3Compat):
+class DQN_MLP(DQNBase, SB3Compat):
     def __init__(self, n_actions, c_in, act_cls=nn.ReLU):
         super().__init__()
         if isinstance(n_actions, tuple): 

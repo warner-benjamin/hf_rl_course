@@ -123,16 +123,16 @@ class TorchAtariReplayBuffer(BaseBuffer):
             action = action.reshape((self.n_envs, self.action_dim))
 
         # Copy to avoid modification by reference
-        self.observations[self.pos] = obs.detach().clone()
+        self.observations[self.pos] = obs.detach()
 
         if self.optimize_memory_usage:
-            self.observations[(self.pos + 1) % self.buffer_size] = next_obs.detach().clone()
+            self.observations[(self.pos + 1) % self.buffer_size] = next_obs.detach()
         else:
-            self.next_observations[self.pos] = next_obs.detach().clone()
+            self.next_observations[self.pos] = next_obs.detach()
 
-        self.actions[self.pos] = action.detach().clone()
-        self.rewards[self.pos] = reward.detach().clone()
-        self.dones[self.pos] = done.detach().clone()
+        self.actions[self.pos] = action.detach()
+        self.rewards[self.pos] = reward.detach()
+        self.dones[self.pos] = done.detach()
 
         if self.handle_timeout_termination:
             self.timeouts[self.pos] = torch.from_numpy(infos["TimeLimit.truncated"]).to(self.device)
